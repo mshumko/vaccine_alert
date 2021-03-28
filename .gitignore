@@ -1,3 +1,4 @@
 password.txt
 vaccination_sites.json
-test_vaccinations.html
+env/
+email_list.csv

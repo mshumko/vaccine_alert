@@ -6,6 +6,7 @@ import pathlib
 import json
 import collections
 import smtplib
+import csv
 import ssl
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
@@ -13,7 +14,7 @@ from email.mime.multipart import MIMEMultipart
 import requests
 from bs4 import BeautifulSoup
 
-Site = collections.namedtuple('Site', ['found', 'site', 'site_info'])
+Site = collections.namedtuple('Site', ['site', 'site_info'])
 
 def get_html(url, search_params):
     """
@@ -76,29 +77,44 @@ def detect_change(current_sites,
             json.dump(current_sites, f)
 
         # Look for matched site in the past list of sites.
-        past_matched_site = _find_matching_site(past_sites, search_address)
-        print('past_matched_site', past_matched_site)
+        past_matched_sites = _find_site_in_html(past_sites, search_address)
+        print('past_matched_site', past_matched_sites)
         # Look for matched site in the current list of sites.
-        current_matched_site = _find_matching_site(current_sites, search_address)
-        print('current_matched_site', current_matched_site)
-        if current_matched_site.found and (not past_matched_site.found):
-            return current_matched_site
+        current_matched_sites = _find_site_in_html(current_sites, search_address)
+        print('current_matched_sites', current_matched_sites)
+
+        if len(current_matched_sites):
+            # Find what matched sites are new and updated.
+            old_sites = []
+            new_sites = []
+
+            past_site_names = [past_matched_site.site for past_matched_site in past_matched_sites]
+            past_site_dates = [past_matched_site.site_info['date'] for past_matched_site in past_matched_sites]
+            past_site_tuple = [(name, date) for name, date in zip(past_site_names, past_site_dates)]
+
+            for current_matched_site in current_matched_sites:
+                current_site_tuple = (current_matched_site.site, current_matched_site.site_info['date'])
+                if current_site_tuple in past_site_tuple:
+                    old_sites.append(current_matched_site)
+                else:
+                    new_sites.append(current_matched_site)
+            return {'new_sites':new_sites, 'old_sites':old_sites}
         else:
-            return Site(False, None, None)
+            return None
 
     else:
         # If this program is run for the first time and json_file_name does not
         # exist, look for search_address in current_sites and email the address matches.
-        matched_site = _find_matching_site(current_sites, search_address)
+        new_sites = _find_site_in_html(current_sites, search_address)
 
         # Save the file
         with open(json_file_name, 'w') as f:
             json.dump(current_sites, f)
 
-        return matched_site
+        return {'new_sites':new_sites, 'old_sites':[]}
     return
 
-def send_email(matched_site, recipients, vaccine_url):
+def send_email(matched_sites_dict, recipients, vaccine_url):
     """
     Sends an email if a vaccination site opens up.
     """
@@ -106,15 +122,35 @@ def send_email(matched_site, recipients, vaccine_url):
     with open('password.txt') as f:
         password = f.read()
 
+    if matched_sites_dict is None:
+        return
+
+    new_sites = matched_sites_dict['new_sites']
+    old_sites = matched_sites_dict['old_sites']
+
+    if len(new_sites) == 0:
+        return
+
+    # Write the text body
     text = (
         f'Hello!\n\nI found a recently-avaliable vaccination site that may interest you!\n\n'
-        f'site: {matched_site.site}\n'
+        f'NEW vaccination sites:\n\n'
     )
+    for new_site in new_sites:
+        text += f'site: {new_site.site}\n'
+        for key, val in new_site.site_info.items():
+            text += f'{key}: {val}\n'
+    
+    if len(old_sites):
+        text += '\n\nOLD Vaccination sites:\n\n'
+    
+        for old_site in old_sites:
+            text += f'site: {old_site.site}\n'
+            for key, val in old_site.site_info.items():
+                text += f'{key}: {val}\n'
+            text += '\n\n'
 
-    for key, val in matched_site.site_info.items():
-        text += f'{key}: {val}\n'
-
-    text += f'\nSearch results are at: {vaccine_url}\n'
+    text += f'Search results are at: {vaccine_url}\n\n'
     text += f'This is an automated message. Blame Mike if you are getting spammed!'
 
     # Create a secure SSL context
@@ -133,41 +169,53 @@ def send_email(matched_site, recipients, vaccine_url):
 
     return
 
-def _find_matching_site(sites, search_address):
+def _find_site_in_html(sites, search_address):
     """
     Searches the sites dictionary and looks for search_address in the 'address'
     key:value pair. This is case insensitive.
     """
+    matched_sites = []
     for site, site_info in sites.items():
         if search_address.lower() in site_info['address'].lower():
-            return Site(True, site, site_info)
-    return Site(False, None, None)
+            matched_sites.append(Site(site, site_info))
+    return matched_sites
 
 if __name__ == '__main__':
+    # Program parameters
     sleep_time_min = 10
-
+    debug = False
+    search_address = 'Bozeman'
+    url = 'https://www.mtreadyclinic.org/clinic/search/'
     search_params = {
         'location':59715,
         'search_radius':'50+miles'
     } 
 
-    recipients = ['shumko.ghost@gmail.com', 'msshumko@gmail.com', 'zethstone@gmail.com']
-
-    search_address = 'Bozeman'
-
-    url = 'https://www.mtreadyclinic.org/clinic/search/'
+    if debug:
+        recipients = ['shumko.ghost@gmail.com']
+    else:
+        # Load email list
+        with open('email_list.csv') as f:
+            reader = csv.reader(f)
+            recipients = [row[0] for row in list(reader)]
 
     while True:
         # Don't check in the middle of the night.
-        if (datetime.now().hour >= 6) and (datetime.now().hour <= 22):
-            request = get_html(url, search_params)
-            print(request.url)
-            current_sites = parse_html(request.text)
-            matched_site = detect_change(current_sites, search_address=search_address)
+        if ((datetime.now().hour >= 6) and (datetime.now().hour <= 22)) or debug:
+            if debug:
+                with open('old_listing.html') as f:
+                    current_sites = parse_html(f.read())
+            else:
+                request = get_html(url, search_params)
+                current_sites = parse_html(request.text)
+            matched_sites_dict = detect_change(current_sites, search_address=search_address)
             
-            if matched_site.found:
-                # Send out the email.
-                send_email(matched_site, recipients, request.url)
+            
+            # Send out the email. (This function will only send it out if a new site is added.)
+            if debug:
+                send_email(matched_sites_dict, recipients, 'Debug')
+            else:
+                send_email(matched_sites_dict, recipients, request.url)
 
             print('Last ran at:', datetime.now().isoformat())
 
